@@ -494,25 +494,38 @@ func playHotSpin(token, phone string) (played int, totalWin float64, freeSpins, 
 	delay := spinDelay()
 
 	// Finish any free spins left over from a previous session first.
-	if _, init, _ := hotSpinInit(token); init.Code == 200 && init.Data.GameStatus == 1 {
+	if _, init, _ := hotSpinInit(token); init.Code == 200 && init.Data.GameStatus == 1 && init.Data.HotSpin.HasHotSpin > 0 {
 		pending := init.Data.HotSpin.OuterRingTimes - init.Data.HotSpin.PlayTimes
+		if pending < 0 {
+			pending = 0
+		}
+		if pending > 0 {
+			outf("%s%s  %s: >>> FREE SPINS pending from last run: %d - playing them now%s\n",
+				boldColor, cyanColor, phone, pending, resetColor)
+		}
+		pendingWin := 0.0
 		for i := 0; i < pending; i++ {
 			code, lres, _ := luckySpin(token)
 			if code != 200 || lres.Code != 200 {
 				break
 			}
 			freeSpins++
+			pendingWin += lres.Data.Win
 			totalWin += lres.Data.Win
 			gameBal = lres.Data.Balance
 			haveBal = true
 			time.Sleep(delay / 2)
+		}
+		if pending > 0 {
+			outf("%s  %s: pending free spins done, won %.2f | balance %.2f%s\n",
+				cyanColor, phone, pendingWin, gameBal, resetColor)
 		}
 	}
 
 	_, coupons, _ := couponAll(token)
 	c := pickCoupon(coupons, hotSpinStake)
 	if c == nil {
-		return 0, 0, freeSpins, 0, 0, false, "no available gift"
+		return 0, totalWin, freeSpins, 0, gameBal, haveBal, "no available gift"
 	}
 	outf("  %s: gift %d loaded with %d spins (stake %.2f, pays %.2f/spin)\n",
 		phone, c.ID, c.Num, hotSpinStake, hotSpinStake-float64(c.FaceValue))
@@ -580,31 +593,54 @@ func playHotSpin(token, phone string) (played int, totalWin float64, freeSpins, 
 		haveBal = true
 		c.Num--
 
-		// Bonus tickets dropped by this spin.
+		// Bonus tickets ("free bets") dropped by this spin. The client claims
+		// each one through /game/scratcher/handle; the win lands in the wallet.
 		for _, t := range bet.Data.ScratcherTickets {
 			if t.ID == 0 {
 				continue
 			}
 			tickets++
-			if sc, sres, _ := claimTicket(token, t.ID); sc == 200 && sres.Code == 200 {
+			sc, sres, _ := claimTicket(token, t.ID)
+			if sc == 200 && sres.Code == 200 {
 				totalWin += sres.Data.Win
 				gameBal = sres.Data.Balance
 				haveBal = true
+				outf("%s%s  %s: >>> FREE BET #%d awarded (id %d) -> won %.2f | balance %.2f%s\n",
+					boldColor, magentaColor, phone, tickets, t.ID, sres.Data.Win, gameBal, resetColor)
+			} else {
+				outf("%s  %s: >>> FREE BET #%d dropped (id %d) but claim failed: %s%s\n",
+					yellowColor, phone, tickets, t.ID, sres.Message, resetColor)
 			}
 		}
 
 		// Hot-spin wheel / free spins awarded by this spin.
-		fs := bet.Data.OuterRingTimes
+		// The wheel (outer_ring_id) is only animation: the server already decided
+		// how many free spins you get in `outer_ring_times` (3, 4, ...). The client
+		// then plays that many free spins through /game/hot-spin/lucky.
+		fs := 0
+		if bet.Data.HotSpin > 0 && bet.Data.OuterRingTimes > 0 {
+			fs = bet.Data.OuterRingTimes
+			outf("%s%s  %s: >>> FREE SPINS AWARDED: %d spins (wheel %d) - playing them now%s\n",
+				boldColor, cyanColor, phone, fs, bet.Data.OuterRingID, resetColor)
+		}
+		fsDone := 0
+		fsWin := 0.0
 		for i := 0; i < fs; i++ {
 			lc, lres, _ := luckySpin(token)
 			if lc != 200 || lres.Code != 200 {
 				break
 			}
+			fsDone++
 			freeSpins++
+			fsWin += lres.Data.Win
 			totalWin += lres.Data.Win
 			gameBal = lres.Data.Balance
 			haveBal = true
 			time.Sleep(delay / 2)
+		}
+		if fs > 0 {
+			outf("%s  %s: free spins done %d/%d, won %.2f | balance %.2f%s\n",
+				cyanColor, phone, fsDone, fs, fsWin, gameBal, resetColor)
 		}
 
 		// Re-sync the gift every 20 spins: only check that it is still offered.
@@ -624,8 +660,8 @@ func playHotSpin(token, phone string) (played int, totalWin float64, freeSpins, 
 					break
 				}
 			}
-			outf("  %s: %d spins done, win %.2f, gift %d has %d left, balance %.2f\n",
-				phone, played, totalWin, c.ID, c.Num, gameBal)
+			outf("  %s: %d spins done, win %.2f, free %d, tickets %d, gift %d has %d left, balance %.2f\n",
+				phone, played, totalWin, freeSpins, tickets, c.ID, c.Num, gameBal)
 		}
 		time.Sleep(delay)
 	}
@@ -680,10 +716,10 @@ func processAccount(acc account, mode string) jobResult {
 		parts = append(parts, fmt.Sprintf("played %d", played))
 		parts = append(parts, fmt.Sprintf("win %.2f", totalWin))
 		if freeSpins > 0 {
-			parts = append(parts, fmt.Sprintf("free %d", freeSpins))
+			parts = append(parts, fmt.Sprintf("free spins %d", freeSpins))
 		}
 		if tickets > 0 {
-			parts = append(parts, fmt.Sprintf("tickets %d", tickets))
+			parts = append(parts, fmt.Sprintf("free bets %d", tickets))
 		}
 		parts = append(parts, fmt.Sprintf("bal %.2f->%.2f", startBal, endBal))
 		res.Spin = strings.Join(parts, " | ")
