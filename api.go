@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -213,11 +214,11 @@ type gmCouponBet struct {
 		InnerRingID   int   `json:"inner_ring_id"`
 		OuterRingID   int   `json:"outer_ring_id"`
 		OuterRingTimes int  `json:"outer_ring_times"`
-		UserReallyBet int   `json:"user_really_bet"`
-		UserBetTimes  int   `json:"user_bet_times"`
-		IsBetActivity int   `json:"is_bet_activity"`
-		ScratcherTickets []int `json:"scratcher_tickets"`
-		GamePool      int   `json:"game_pool"`
+		UserReallyBet int        `json:"user_really_bet"`
+		UserBetTimes  int        `json:"user_bet_times"`
+		IsBetActivity int        `json:"is_bet_activity"`
+		ScratcherTickets []gmTicket `json:"scratcher_tickets"`
+		GamePool      int        `json:"game_pool"`
 		GetTicketIncBet int  `json:"get_ticket_inc_bet"`
 	} `json:"data"`
 }
@@ -316,27 +317,322 @@ func couponAll(token string) (int, []gmCoupon, []byte) {
 	return resp.StatusCode, out.Data, buf.Bytes()
 }
 
-func couponBet(token string, couponID int64, dataID int, betAmount float64, roomId int) (int, gmCouponBet, []byte) {
-	body := fmt.Sprintf("data={\"id\":%d,\"bet_amount\":%.2f}&coupon_id=%d&coupon_type=1&token=%s&roomId=%d&device=0",
-		dataID, betAmount, couponID, url.QueryEscape(token), roomId)
-	req, _ := http.NewRequest("POST", "https://api.gamemania.co.ke/single-game/v1.0.6/coupon/bet", strings.NewReader(body))
+// ---------- Hot Spin game ----------
+//
+// Mirrors the real game client (casino2-release / hotSpin):
+//   init   POST /game/hot-spin/init   token, game_id=3013, is_gift=0, roomId=3013, device=0
+//   bet    POST /coupon/bet           token, data={"id":20,"bet_amount":0.25}, coupon_id, coupon_type, roomId, device
+//   bet    POST /game/hot-spin/bet    same, no coupon fields (used only when no gift is left)
+//   free   POST /game/hot-spin/lucky  token, roomId, device
+//   gift   POST /game/scratcher/handle token, game_id, id
+//
+// Stake = 20 lines * 0.25 = 5 KES. A type-1 gift covers `faceValue` KES of the
+// stake (2 KES here), so a spin really costs 3 KES while the gift lasts.
+
+const (
+	gameBaseURL   = "https://api.gamemania.co.ke/single-game/v1.0.6"
+	hotSpinGameID = 3013
+	hotSpinLines  = 20
+	hotSpinBPL    = 0.25
+	hotSpinStake  = hotSpinLines * hotSpinBPL
+)
+
+type gmTicket struct {
+	ID int `json:"id"`
+}
+
+type gmHotSpin struct {
+	HasHotSpin      int    `json:"has_hot_spin"`
+	PlayTimes       int    `json:"play_times"`
+	OuterRingID     int    `json:"outer_ring_id"`
+	InnerRingID     int    `json:"inner_ring_id"`
+	OuterRingTimes  int    `json:"outer_ring_times"`
+	FreeSpinData    any    `json:"free_spin_data"`
+}
+
+type gmHotSpinInit struct {
+	Code int `json:"code"`
+	Data struct {
+		GameStatus       int        `json:"game_status"`
+		HotSpin          gmHotSpin  `json:"hot_spin"`
+		UserReallyBet    float64    `json:"user_really_bet"`
+		UserBetTimes     int        `json:"user_bet_times"`
+		ScratcherTickets []gmTicket `json:"scratcher_tickets"`
+	} `json:"data"`
+	Message string `json:"message"`
+}
+
+func gamePost(path, body string) (int, []byte, error) {
+	req, err := http.NewRequest("POST", gameBaseURL+path, strings.NewReader(body))
+	if err != nil {
+		return 0, nil, err
+	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
+	req.Header.Set("Origin", "https://www.gamemania.co.ke")
+	req.Header.Set("Referer", "https://www.gamemania.co.ke/")
 	resp, err := directClient.Do(req)
 	if err != nil {
-		return 0, gmCouponBet{}, nil
+		return 0, nil, err
 	}
 	defer resp.Body.Close()
 	var buf bytes.Buffer
-	buf.ReadFrom(resp.Body)
-	var out gmCouponBet
-	_ = json.Unmarshal(buf.Bytes(), &out)
-	return resp.StatusCode, out, buf.Bytes()
+	if _, err := buf.ReadFrom(resp.Body); err != nil {
+		return resp.StatusCode, nil, err
+	}
+	return resp.StatusCode, buf.Bytes(), nil
 }
 
-func hotSpinInit(token string) (int, []byte, error) {
-	status, raw, err := doAPI("/single-game/v1.0.6/game/hot-spin/init", map[string]any{"token": token})
-	return status, raw, err
+func hotSpinInit(token string) (int, gmHotSpinInit, []byte) {
+	body := fmt.Sprintf("token=%s&game_id=%d&is_gift=0&roomId=%d&device=0",
+		url.QueryEscape(token), hotSpinGameID, hotSpinGameID)
+	status, raw, err := gamePost("/game/hot-spin/init", body)
+	var out gmHotSpinInit
+	if err == nil {
+		_ = json.Unmarshal(raw, &out)
+	}
+	return status, out, raw
+}
+
+func luckySpin(token string) (int, gmCouponBet, []byte) {
+	body := fmt.Sprintf("token=%s&roomId=%d&device=0", url.QueryEscape(token), hotSpinGameID)
+	status, raw, err := gamePost("/game/hot-spin/lucky", body)
+	var out gmCouponBet
+	if err == nil {
+		_ = json.Unmarshal(raw, &out)
+	}
+	return status, out, raw
+}
+
+func claimTicket(token string, id int) (int, gmCouponBet, []byte) {
+	body := fmt.Sprintf("token=%s&game_id=%d&id=%d", url.QueryEscape(token), hotSpinGameID, id)
+	status, raw, err := gamePost("/game/scratcher/handle", body)
+	var out gmCouponBet
+	if err == nil {
+		_ = json.Unmarshal(raw, &out)
+	}
+	return status, out, raw
+}
+
+// placeBet sends one spin. `coupon` may be nil (plain game bet, no gift).
+func placeBet(token string, coupon *gmCoupon) (int, gmCouponBet, []byte) {
+	data := fmt.Sprintf("data={\"id\":%d,\"bet_amount\":%.2f}", hotSpinLines, hotSpinBPL)
+	var path, body string
+	if coupon != nil {
+		path = "/coupon/bet"
+		body = data + fmt.Sprintf("&coupon_id=%d&coupon_type=%d&token=%s&roomId=%d&device=0",
+			coupon.ID, coupon.Type, url.QueryEscape(token), hotSpinGameID)
+	} else {
+		path = "/game/hot-spin/bet"
+		body = data + fmt.Sprintf("&token=%s&roomId=%d&device=0",
+			url.QueryEscape(token), hotSpinGameID)
+	}
+	status, raw, err := gamePost(path, body)
+	var out gmCouponBet
+	if err == nil {
+		_ = json.Unmarshal(raw, &out)
+	}
+	return status, out, raw
+}
+
+func logout(token string) {
+	if token == "" {
+		return
+	}
+	_, _, _ = doAPI("/logout", map[string]any{"token": token})
+}
+
+func containsInt(xs []int, v int) bool {
+	for _, x := range xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// pickCoupon mirrors the client's getCanUseCoupon(): type-1 gifts only apply when
+// bet_limit <= stake; type-2 gifts apply to any stake. Highest faceValue wins.
+func pickCoupon(coupons []gmCoupon, stake float64) *gmCoupon {
+	var best *gmCoupon
+	for i := range coupons {
+		c := &coupons[i]
+		if c.Num <= 0 {
+			continue
+		}
+		if len(c.Games) > 0 && !containsInt(c.Games, hotSpinGameID) {
+			continue
+		}
+		if c.Type == 1 {
+			if float64(c.BetLimit) > stake {
+				continue
+			}
+		} else if c.Type != 2 {
+			continue
+		}
+		if best == nil || c.FaceValue > best.FaceValue {
+			best = c
+		}
+	}
+	return best
+}
+
+func spinDelay() time.Duration {
+	ms := 1500 // let each spin animation settle before the next request
+	if v := strings.TrimSpace(os.Getenv("GAMEMANIA_SPIN_DELAY_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			ms = n
+		}
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+// playHotSpin runs the "UNTIL STOP" auto spin: keep spinning with the active
+// gift until the API has no usable gift left ("no available gifts"), then stop.
+func playHotSpin(token, phone string) (played int, totalWin float64, freeSpins, tickets int, gameBal float64, haveBal bool, reason string) {
+	delay := spinDelay()
+
+	// Finish any free spins left over from a previous session first.
+	if _, init, _ := hotSpinInit(token); init.Code == 200 && init.Data.GameStatus == 1 {
+		pending := init.Data.HotSpin.OuterRingTimes - init.Data.HotSpin.PlayTimes
+		for i := 0; i < pending; i++ {
+			code, lres, _ := luckySpin(token)
+			if code != 200 || lres.Code != 200 {
+				break
+			}
+			freeSpins++
+			totalWin += lres.Data.Win
+			gameBal = lres.Data.Balance
+			haveBal = true
+			time.Sleep(delay / 2)
+		}
+	}
+
+	_, coupons, _ := couponAll(token)
+	c := pickCoupon(coupons, hotSpinStake)
+	if c == nil {
+		return 0, 0, freeSpins, 0, 0, false, "no available gift"
+	}
+	outf("  %s: gift %d loaded with %d spins (stake %.2f, pays %.2f/spin)\n",
+		phone, c.ID, c.Num, hotSpinStake, hotSpinStake-float64(c.FaceValue))
+	invalid := 0
+	for played < 5000 {
+		if c == nil || c.Num <= 0 {
+			// This gift is spent - look for another one before giving up.
+			spentID := int64(0)
+			if c != nil {
+				spentID = c.ID
+			}
+			_, cps, _ := couponAll(token)
+			for i := range cps {
+				if cps[i].ID == spentID {
+					cps[i].Num = 0
+				}
+			}
+			if c = pickCoupon(cps, hotSpinStake); c == nil {
+				reason = "no available gift"
+				break
+			}
+		}
+		cost := hotSpinStake - float64(c.FaceValue)
+		if cost < 0 {
+			cost = 0
+		}
+		if haveBal && gameBal < cost {
+			reason = fmt.Sprintf("balance too low (%.2f < %.2f)", gameBal, cost)
+			break
+		}
+		status, bet, raw := placeBet(token, c)
+		if status != 200 || bet.Code != 200 {
+			msg := bet.Message
+			if msg == "" {
+				msg = strings.TrimSpace(string(raw))
+			}
+			low := strings.ToLower(msg)
+			switch {
+			case strings.Contains(low, "no available"):
+				reason = "no available gift"
+			case bet.Code == 407 || strings.Contains(low, "coupon invalid"):
+				// Gift expired or spent server-side - look for another one.
+				invalid++
+				if invalid > 3 {
+					reason = "no available gift (" + msg + ")"
+					break
+				}
+				_, cps, _ := couponAll(token)
+				if c = pickCoupon(cps, hotSpinStake); c != nil {
+					continue
+				}
+				reason = "no available gift"
+			case bet.Code == 300:
+				reason = "session expired"
+			case strings.Contains(low, "balance") || bet.Code == 5002:
+				reason = "balance too low: " + msg
+			default:
+				reason = "bet failed: " + msg
+			}
+			break
+		}
+		played++
+		totalWin += bet.Data.Win
+		gameBal = bet.Data.Balance
+		haveBal = true
+		c.Num--
+
+		// Bonus tickets dropped by this spin.
+		for _, t := range bet.Data.ScratcherTickets {
+			if t.ID == 0 {
+				continue
+			}
+			tickets++
+			if sc, sres, _ := claimTicket(token, t.ID); sc == 200 && sres.Code == 200 {
+				totalWin += sres.Data.Win
+				gameBal = sres.Data.Balance
+				haveBal = true
+			}
+		}
+
+		// Hot-spin wheel / free spins awarded by this spin.
+		fs := bet.Data.OuterRingTimes
+		for i := 0; i < fs; i++ {
+			lc, lres, _ := luckySpin(token)
+			if lc != 200 || lres.Code != 200 {
+				break
+			}
+			freeSpins++
+			totalWin += lres.Data.Win
+			gameBal = lres.Data.Balance
+			haveBal = true
+			time.Sleep(delay / 2)
+		}
+
+		// Re-sync the gift every 20 spins: only check that it is still offered.
+		// (The real client counts uses locally, so we must not reset our count.)
+		if played%20 == 0 {
+			_, cps, _ := couponAll(token)
+			stillThere := false
+			for _, cp := range cps {
+				if cp.ID == c.ID && cp.Num > 0 {
+					stillThere = true
+					break
+				}
+			}
+			if !stillThere {
+				if c = pickCoupon(cps, hotSpinStake); c == nil {
+					reason = "no available gift"
+					break
+				}
+			}
+			outf("  %s: %d spins done, win %.2f, gift %d has %d left, balance %.2f\n",
+				phone, played, totalWin, c.ID, c.Num, gameBal)
+		}
+		time.Sleep(delay)
+	}
+	if reason == "" {
+		reason = "stopped"
+	}
+	return
 }
 
 func processAccount(acc account, mode string) jobResult {
@@ -359,6 +655,7 @@ func processAccount(acc account, mode string) jobResult {
 		return res
 	}
 	token := auth.Data.Token
+	defer logout(token)
 	res.Status = "OK"
 	ist, info, _ := userInfo(token)
 	if ist == 200 && info.Code == 200 {
@@ -370,88 +667,28 @@ func processAccount(acc account, mode string) jobResult {
 	if mode == "balance" {
 		return res
 	}
-	// Hot Spin game flow: get coupons, pick the 2-shilling stake-5 bonus coupon
-	_, coupons, _ := couponAll(token)
-	if len(coupons) == 0 {
-		res.Spin = "no available gift"
-		return res
-	}
-	// pick coupon with faceValue=2 and bet_limit=5 (the bonus coupon)
-	c := coupons[0]
-	for _, cp := range coupons {
-		if cp.FaceValue == 2 && cp.BetLimit == 5 {
-			c = cp
-			break
-		}
-	}
-	// fallback: prefer "First Deposit" label
-	for _, cp := range coupons {
-		if strings.Contains(strings.ToLower(cp.Label), "first deposit") {
-			c = cp
-			break
-		}
-	}
-	// The coupon has c.Num spins (125-250). Play all of them.
-	outf("  %s: playing %d spins with coupon %d\n", phone, c.Num, c.ID)
-	// play until "no available gift" or balance depleted
-	totalWin := 0.0
-	played := 0
-	freeSpins := 0
-	for {
-		sst, bet, sraw := couponBet(token, c.ID, 20, 0.25, 3013)
-		if sst != 200 || bet.Code != 200 {
-			msg := bet.Message
-			if msg == "" {
-				msg = string(sraw)
-			}
-			if strings.Contains(strings.ToLower(msg), "no available") {
-				res.Spin = "no available gift"
-			} else {
-				res.Spin = fmt.Sprintf("bet failed: %s", msg)
-			}
-			break
-		}
-		totalWin += bet.Data.Win
-		played++
-		if bet.Data.HotSpin > 0 {
-			freeSpins += bet.Data.HotSpin
-		}
-		if len(bet.Data.ScratcherTickets) > 0 {
-			freeSpins += len(bet.Data.ScratcherTickets)
-		}
-		if bet.Data.Balance > 0 {
-			res.Balance = fmt.Sprintf("%.2f", bet.Data.Balance)
-		}
-		// only stop when "no available gift" message is received from the API
-		if strings.Contains(strings.ToLower(bet.Message), "no available") {
-			res.Spin = "no available gift"
-			break
-		}
-	}
-	// refresh final balance and coins
-	_, info3, _ := userInfo(token)
-	info = info3
-	if info.Code == 200 {
-		res.Coins = fmt.Sprintf("%d", info.Data.Coins)
-		res.Balance = fmt.Sprintf("%.2f", info.Data.Balance)
-	}
-	if res.Spin == "no available gift" {
-		// keep as is, but append free spins if any
+
+	startBal := info.Data.Balance
+	played, totalWin, freeSpins, tickets, _, _, reason := playHotSpin(token, phone)
+
+	// Refresh the authoritative wallet after the run.
+	if _, info2, _ := userInfo(token); info2.Code == 200 {
+		res.Balance = fmt.Sprintf("%.2f", info2.Data.Balance)
+		res.Coins = fmt.Sprintf("%d", info2.Data.Coins)
+		endBal := info2.Data.Balance
+		parts := []string{reason}
+		parts = append(parts, fmt.Sprintf("played %d", played))
+		parts = append(parts, fmt.Sprintf("win %.2f", totalWin))
 		if freeSpins > 0 {
-			res.Spin = fmt.Sprintf("no available gift (free spins: %d)", freeSpins)
+			parts = append(parts, fmt.Sprintf("free %d", freeSpins))
 		}
-	} else if totalWin > 0 {
-		msg := fmt.Sprintf("won %.2f (played %d spins)", totalWin, played)
-		if freeSpins > 0 {
-			msg += fmt.Sprintf(" + %d free spins", freeSpins)
+		if tickets > 0 {
+			parts = append(parts, fmt.Sprintf("tickets %d", tickets))
 		}
-		res.Spin = msg
+		parts = append(parts, fmt.Sprintf("bal %.2f->%.2f", startBal, endBal))
+		res.Spin = strings.Join(parts, " | ")
 	} else {
-		msg := fmt.Sprintf("played %d spins, no win", played)
-		if freeSpins > 0 {
-			msg += fmt.Sprintf(" + %d free spins", freeSpins)
-		}
-		res.Spin = msg
+		res.Spin = fmt.Sprintf("%s | played %d | win %.2f", reason, played, totalWin)
 	}
 	return res
 }

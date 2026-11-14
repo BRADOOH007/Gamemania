@@ -17,7 +17,7 @@ import (
 	"github.com/mattn/go-isatty"
 )
 
-var tuiModes = []string{"Balance", "Login + Hot Spin"}
+var tuiModes = []string{"Balance", "Login + Hot Spin (until gift ends)"}
 
 type tuiState int
 
@@ -516,7 +516,7 @@ func runCLI() {
 		fmt.Println()
 		fmt.Println(boldColor + cyanColor + "=== GAMEMANIA ===" + resetColor)
 		fmt.Println(greenColor + "1. Balance" + resetColor)
-		fmt.Println(greenColor + "2. Login + Hot Spin" + resetColor)
+		fmt.Println(greenColor + "2. Login + Hot Spin (until gift ends)" + resetColor)
 		fmt.Println("0. Exit")
 		choice := readLine("Select option: ")
 		switch choice {
