@@ -17,7 +17,7 @@ import (
 	"github.com/mattn/go-isatty"
 )
 
-var tuiModes = []string{"Balance", "Login + Hot Spin (until gift ends)"}
+var tuiModes = []string{"Balance", "Login + Hot Spin (until gift ends)", "Check in + Coins Spin"}
 
 type tuiState int
 
@@ -377,7 +377,7 @@ func (m tuiModel) startJob() (tea.Model, tea.Cmd) {
 		}
 	}()
 	go func() {
-		modeName := []string{"balance", "login"}[m.mode]
+		modeName := []string{"balance", "login", "coins"}[m.mode]
 		runBatch(m.accounts, modeName)
 		pw.Close()
 		setJobOutput(os.Stdout)
@@ -517,12 +517,13 @@ func runCLI() {
 		fmt.Println(boldColor + cyanColor + "=== GAMEMANIA ===" + resetColor)
 		fmt.Println(greenColor + "1. Balance" + resetColor)
 		fmt.Println(greenColor + "2. Login + Hot Spin (until gift ends)" + resetColor)
+		fmt.Println(greenColor + "3. Check in + Coins Spin" + resetColor)
 		fmt.Println("0. Exit")
 		choice := readLine("Select option: ")
 		switch choice {
 		case "0", "":
 			return
-		case "1", "2":
+		case "1", "2", "3":
 			accounts := readAccountsInteractive()
 			if len(accounts) == 0 {
 				fmt.Println("No accounts found.")
@@ -531,6 +532,9 @@ func runCLI() {
 			mode := "balance"
 			if choice == "2" {
 				mode = "login"
+			}
+			if choice == "3" {
+				mode = "coins"
 			}
 			runBatch(accounts, mode)
 		default:

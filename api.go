@@ -155,11 +155,16 @@ func doAPI(path string, payload map[string]any) (int, []byte, error) {
 // ---------- Gamemania types ----------
 
 type gmUser struct {
-	Nickname string  `json:"nickname"`
-	Balance  float64 `json:"balance"`
-	Coins    int     `json:"coins"`
-	Mobile   string  `json:"mobile"`
-	UserID   int     `json:"userId"`
+	Nickname      string  `json:"nickname"`
+	Balance       float64 `json:"balance"`
+	Coins         int     `json:"coins"`
+	Mobile        string  `json:"mobile"`
+	UserID        int     `json:"userId"`
+	DaysNumber    int     `json:"daysNumber"`
+	IsAttendance  bool    `json:"isAttendance"`
+	SingleGifts   int     `json:"singleGifts"`
+	GiftsNumber   int     `json:"giftsNumber"`
+	FirstDeposit  int     `json:"first_deposit_activity"`
 }
 
 type gmAuth struct {
@@ -292,6 +297,26 @@ func userInfo(token string) (int, gmUserInfo, []byte) {
 func bigWheel(token string) (int, gmBigWheel, []byte) {
 	status, raw, err := doAPI("/user/big-wheel", map[string]any{"token": token})
 	var out gmBigWheel
+	if err == nil {
+		_ = json.Unmarshal(raw, &out)
+	}
+	return status, out, raw
+}
+
+// gmSignIn is the daily check-in ("Check in Now") that feeds the coin balance.
+type gmSignIn struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		Coins        int  `json:"coins"`
+		DaysNumber   int  `json:"daysNumber"`
+		IsAttendance bool `json:"isAttendance"`
+	} `json:"data"`
+}
+
+func signIn(token string) (int, gmSignIn, []byte) {
+	status, raw, err := doAPI("/user/sign-in", map[string]any{"token": token})
+	var out gmSignIn
 	if err == nil {
 		_ = json.Unmarshal(raw, &out)
 	}
@@ -671,6 +696,124 @@ func playHotSpin(token, phone string) (played int, totalWin float64, freeSpins, 
 	return
 }
 
+// ---------- Daily coins ----------
+//
+// Coins are earned by the daily check-in and by playing; the only way to spend
+// them is the Coins Spin (POST /user/big-wheel), 20 coins per draw. Prizes go
+// straight to the account: cash to the main wallet, gifts to My Benefits ->
+// Gifts, energy to Africa Zoo.
+
+const coinSpinCost = 20
+
+// coinPrize maps the server `rid` to the wheel slice label. The client indexes
+// its slice table with rid and skips the result popup for rid 3 ("Try Again").
+var coinPrize = map[int]string{
+	1:  "Ksh 5 Cash",
+	2:  "Ksh 10 Cash",
+	3:  "Try Again",
+	4:  "Ksh 1 Cash",
+	5:  "Ksh 2 Cash",
+	6:  "Ksh 5 Gift",
+	7:  "Ksh 2 Gift x5",
+	8:  "Ksh 100 Cash",
+	9:  "Ksh 500 Cash",
+	10: "Ksh 1000 Cash",
+	11: "10 Energy",
+	12: "20 Energy",
+}
+
+func playCoins(token, phone string) (checkedIn bool, checkInGain int, spins int, prizes []string, coinsStart, coinsEnd int, reason string) {
+	delay := spinDelay() / 2
+	if delay < 300*time.Millisecond {
+		delay = 300 * time.Millisecond
+	}
+
+	ist, info, _ := userInfo(token)
+	if ist != 200 || info.Code != 200 {
+		return false, 0, 0, nil, 0, 0, "cannot read coin balance"
+	}
+	coinsStart, coinsEnd = info.Data.Coins, info.Data.Coins
+	outf("  %s: %d coins, streak day %d, checked in today: %t\n",
+		phone, coinsStart, info.Data.DaysNumber, info.Data.IsAttendance)
+
+	// 1. Daily check-in.
+	if !info.Data.IsAttendance {
+		sc, sres, _ := signIn(token)
+		if sc == 200 && sres.Code == 200 {
+			checkedIn = true
+			before := coinsEnd
+			if sres.Data.Coins > 0 {
+				coinsEnd = sres.Data.Coins
+			}
+			checkInGain = coinsEnd - before
+			if checkInGain <= 0 {
+				checkInGain = coinCheckInReward(info.Data.DaysNumber)
+				coinsEnd = before + checkInGain
+			}
+			outf("%s  %s: >>> CHECK-IN +%d coins (streak day %d) -> %d coins%s\n",
+				greenColor, phone, checkInGain, sres.Data.DaysNumber, coinsEnd, resetColor)
+		} else {
+			outf("%s  %s: check-in failed: %s%s\n", yellowColor, phone, signInMsg(sres.Msg, sc), resetColor)
+		}
+	} else {
+		outf("  %s: already checked in today - no daily coins\n", phone)
+	}
+
+	// 2. Spend coins on the wheel, 20 per draw.
+	for spins < 50 && coinsEnd >= coinSpinCost {
+		status, res, raw := bigWheel(token)
+		if status != 200 || res.Code != 200 {
+			msg := res.Msg
+			if msg == "" {
+				msg = strings.TrimSpace(string(raw))
+			}
+			reason = "coin spin failed: " + msg
+			break
+		}
+		spins++
+		label := coinPrize[res.Data.Rid]
+		if label == "" {
+			label = fmt.Sprintf("reward #%d", res.Data.Rid)
+		}
+		if res.Data.Rid != 3 {
+			prizes = append(prizes, label)
+		}
+		coinsEnd = res.Data.Coins
+		outf("%s  %s: >>> COIN SPIN %d -> %s | %d coins left%s\n",
+			magentaColor, phone, spins, label, coinsEnd, resetColor)
+		time.Sleep(delay)
+	}
+
+	if reason == "" {
+		switch {
+		case spins > 0:
+			reason = "coins spent"
+		case coinsEnd < coinSpinCost:
+			reason = fmt.Sprintf("not enough coins (%d < %d)", coinsEnd, coinSpinCost)
+		default:
+			reason = "stopped"
+		}
+	}
+	return
+}
+
+// coinCheckInReward is the published 7-day check-in ladder (+20/+20/+40/+45/
+// +60/+65/+100) used only when the server response omits the new balance.
+func coinCheckInReward(streakDay int) int {
+	ladder := []int{20, 20, 40, 45, 60, 65, 100}
+	if streakDay < 0 || streakDay >= len(ladder) {
+		return 20
+	}
+	return ladder[streakDay]
+}
+
+func signInMsg(msg string, status int) string {
+	if msg != "" {
+		return msg
+	}
+	return fmt.Sprintf("HTTP %d", status)
+}
+
 func processAccount(acc account, mode string) jobResult {
 	res := jobResult{Phone: acc.Phone, Mode: mode}
 	phone := normalizePhone(acc.Phone)
@@ -701,6 +844,30 @@ func processAccount(acc account, mode string) jobResult {
 		res.Balance = "?"
 	}
 	if mode == "balance" {
+		return res
+	}
+
+	if mode == "coins" {
+		coinsBefore := info.Data.Coins
+		checkedIn, gain, spins, prizes, _, coinsAfter, reason := playCoins(token, phone)
+		if _, info2, _ := userInfo(token); info2.Code == 200 {
+			res.Balance = fmt.Sprintf("%.2f", info2.Data.Balance)
+			res.Coins = fmt.Sprintf("%d", info2.Data.Coins)
+		} else {
+			res.Coins = fmt.Sprintf("%d", coinsAfter)
+		}
+		parts := []string{reason}
+		if checkedIn {
+			parts = append(parts, fmt.Sprintf("check-in +%d", gain))
+		} else {
+			parts = append(parts, "check-in skipped")
+		}
+		parts = append(parts, fmt.Sprintf("spins %d", spins))
+		if len(prizes) > 0 {
+			parts = append(parts, "won "+strings.Join(prizes, ", "))
+		}
+		parts = append(parts, fmt.Sprintf("coins %d->%d", coinsBefore, coinsAfter))
+		res.Spin = strings.Join(parts, " | ")
 		return res
 	}
 
